@@ -516,25 +516,31 @@ CUSTOMER_PROFILES = [
     ("👩‍🦱", "먹방 유튜버"),
 ]
 
-# 이닝별 목표 매출(골드) 및 제한 시간(초)
 INNING_CONFIG = {
     1: {"target": 22000, "duration": 36},
     2: {"target": 32000, "duration": 36},
     3: {"target": 42000, "duration": 36},
     4: {"target": 52000, "duration": 38},
-    5: {"target": 65000, "duration": 42},  # 5회말 종료 후 클리닝 타임 러시 포함
+    5: {"target": 65000, "duration": 42},
     6: {"target": 76000, "duration": 38},
     7: {"target": 88000, "duration": 40},
     8: {"target": 100000, "duration": 40},
-    9: {"target": 120000, "duration": 44},  # 9회말 끝내기 찬스 포함
+    9: {"target": 120000, "duration": 44},
 }
 
 
 # ==========================================
-# 3. Web Audio API 신시사이저 (외부 파일 불필요)
+# 3. Web Audio API 신시사이저 (주방 라이브 효과음 포함)
 # ==========================================
-def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: bool):
+def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, is_cooking: bool, muted: bool):
+    """
+    HTML5 Web Audio API로 다음 사운드를 실시간 합성:
+    - 주방 조리 라이브 사운드: 기름 튀김 자글자글(fry_start), 팬 볶음/불쇼(pan_start),
+      조리 중 은은한 기름 끓는 배경음(IS_COOKING), 조리 완료 주방 벨(cook_ready)
+    - 파울볼/라인드라이브 경고음, 캐치 팡파르, 피버 타임 8비트 응원가 비트
+    """
     js_fever = "true" if (is_fever and not muted) else "false"
+    js_cooking = "true" if (is_cooking and not muted) else "false"
     js_muted = "true" if muted else "false"
 
     html_code = f"""
@@ -543,6 +549,7 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
         const SOUND_ID = {sound_id};
         const SOUND_TYPE = "{sound_type}";
         const IS_FEVER = {js_fever};
+        const IS_COOKING = {js_cooking};
         const IS_MUTED = {js_muted};
 
         const parentWin = window.parent || window;
@@ -565,9 +572,14 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
             parentWin.document.addEventListener('pointerdown', unlockAudio, {{ once: true }});
         }} catch(e) {{}}
 
+        // 기존 루프 타이머 정리
         if (parentWin._feverTimer) {{
             clearInterval(parentWin._feverTimer);
             parentWin._feverTimer = null;
+        }}
+        if (parentWin._kitchenLoopTimer) {{
+            clearInterval(parentWin._kitchenLoopTimer);
+            parentWin._kitchenLoopTimer = null;
         }}
 
         if (IS_MUTED) return;
@@ -586,7 +598,7 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
         }}
 
         function playNoise(startTime, duration, vol=0.18) {{
-            const bufferSize = ctx.sampleRate * duration;
+            const bufferSize = Math.max(1, Math.floor(ctx.sampleRate * duration));
             const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
             const data = buffer.getChannelData(0);
             for (let i = 0; i < bufferSize; i++) {{
@@ -602,11 +614,57 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
             noise.start(startTime);
         }}
 
+        // 주방 전용 리얼 지글지글(Sizzle) 필터 노이즈 생성기
+        function playSizzle(startTime, duration, centerFreq=2600, qVal=1.2, vol=0.16) {{
+            const bufferSize = Math.max(1, Math.floor(ctx.sampleRate * duration));
+            const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {{
+                // 기름 방울이 톡톡 튀는 질감을 위해 간헐적 피크 추가
+                const pop = Math.random() > 0.985 ? (Math.random() * 2 - 1) * 1.6 : 0;
+                data[i] = (Math.random() * 2 - 1) * 0.65 + pop;
+            }}
+            const noise = ctx.createBufferSource();
+            noise.buffer = buffer;
+
+            const filter = ctx.createBiquadFilter();
+            filter.type = "bandpass";
+            filter.frequency.setValueAtTime(centerFreq, startTime);
+            filter.frequency.linearRampToValueAtTime(centerFreq * 1.25, startTime + duration * 0.4);
+            filter.frequency.linearRampToValueAtTime(centerFreq * 0.85, startTime + duration);
+            filter.Q.setValueAtTime(qVal, startTime);
+
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0.01, startTime);
+            gain.gain.linearRampToValueAtTime(vol, startTime + 0.06);
+            gain.gain.exponentialRampToValueAtTime(0.002, startTime + duration);
+
+            noise.connect(filter);
+            filter.connect(gain);
+            gain.connect(ctx.destination);
+            noise.start(startTime);
+        }}
+
+        // 단발성 효과음 재생
         if (parentWin._lastPlayedSoundId !== SOUND_ID) {{
             parentWin._lastPlayedSoundId = SOUND_ID;
             const now = ctx.currentTime;
 
-            if (SOUND_TYPE === "foul_alert") {{
+            if (SOUND_TYPE === "fry_start") {{
+                // 순살치킨: 기름에 퐁당 빠지며 자글자글 튀겨지는 소리
+                playTone(260, "sine", now, 0.08, 0.14);
+                playTone(390, "sine", now + 0.04, 0.07, 0.12);
+                playSizzle(now + 0.03, 1.35, 3100, 1.1, 0.22);
+            }} else if (SOUND_TYPE === "pan_start") {{
+                // 크림새우&떡볶이: 가스 불꽃 점화음(탁! 화르륵) + 팬 볶음 지글거림
+                playTone(1100, "triangle", now, 0.03, 0.2);
+                playSizzle(now + 0.03, 0.25, 650, 0.8, 0.22); // 가스 점화 '화르륵'
+                playSizzle(now + 0.15, 1.35, 2200, 1.4, 0.20); // 팬 볶음 '지글지글'
+            }} else if (SOUND_TYPE === "cook_ready") {{
+                // 주방 조리 완료 타이머 벨 ('딩~동!')
+                playTone(1318.51, "sine", now, 0.25, 0.18);
+                playTone(1760.00, "sine", now + 0.12, 0.45, 0.20);
+            }} else if (SOUND_TYPE === "foul_alert") {{
                 playNoise(now, 0.08, 0.3);
                 playTone(920, "triangle", now, 0.09, 0.25);
                 playTone(880, "sawtooth", now + 0.12, 0.16, 0.16);
@@ -630,6 +688,7 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
                 playTone(987.77, "sine", now, 0.07, 0.14);
                 playTone(1318.51, "sine", now + 0.07, 0.14, 0.14);
             }} else if (SOUND_TYPE === "burn") {{
+                playSizzle(now, 0.45, 1400, 2.0, 0.18);
                 playTone(220, "sawtooth", now, 0.14, 0.15);
                 playTone(165, "sawtooth", now + 0.15, 0.2, 0.15);
             }} else if (SOUND_TYPE === "fever_start") {{
@@ -650,6 +709,17 @@ def render_sound_engine(sound_id: int, sound_type: str, is_fever: bool, muted: b
             }}
         }}
 
+        // 조리 중인 슬롯이 있으면 주방 현장 지글거림 루프 재생
+        if (IS_COOKING) {{
+            const pulseKitchenSizzle = () => {{
+                if (ctx.state !== 'running') return;
+                playSizzle(ctx.currentTime, 0.85, 2800, 1.3, 0.09);
+            }};
+            pulseKitchenSizzle();
+            parentWin._kitchenLoopTimer = setInterval(pulseKitchenSizzle, 820);
+        }}
+
+        // 피버 타임 전용 8비트 야구장 응원가 비트 루프
         if (IS_FEVER) {{
             const cheerMelody = [
                 523.25, 523.25, 659.25, 783.99,
@@ -737,7 +807,6 @@ def toggle_pause():
 
 
 def get_max_customer_slots(now: float) -> int:
-    """5회말 클리닝 타임 러시 중에는 대기석 6칸 확장, 평상시 4칸"""
     return 6 if now < st.session_state.cleaning_until else 4
 
 
@@ -754,16 +823,15 @@ def spawn_customer(now: float, is_fever: bool):
     inning = st.session_state.get("inning", 1)
     cust_type = "normal"
 
-    # 야구팬 밈 특수 손님 확률 배정
     r = random.random()
     if r < stadium_cfg["cheer_prob"]:
         cust_type = "cheerleader"
     elif inning >= 2 and r < stadium_cfg["cheer_prob"] + 0.14:
-        cust_type = "saint"  # 보살팬
+        cust_type = "saint"
     elif inning >= 3 and r < stadium_cfg["cheer_prob"] + 0.25:
-        cust_type = "impatient"  # 성격 급한 단골
+        cust_type = "impatient"
     elif inning >= 3 and r < stadium_cfg["cheer_prob"] + 0.33:
-        cust_type = "catcher"  # 포수장비 풀착장 팬
+        cust_type = "catcher"
 
     if cust_type == "cheerleader":
         avatar, role = "📣", "열혈 응원단장"
@@ -895,8 +963,6 @@ def activate_fever(now: float, reason: str):
 
 
 def spawn_ball_event(now: float, ball_type: str):
-    """파울 플라이(3.5s) / 총알 라인드라이브(2.0s) / 기록 홈런볼(2.8s) 발동"""
-    # 대기석에 '포수장비 풀착장팬'이 있으면 파울볼을 대신 캐치해주는 야구팬 밈 기믹!
     catcher_fans = [c for c in st.session_state.customers if c.get("cust_type") == "catcher"]
     if catcher_fans and ball_type in ("fly", "linedrive"):
         fan = catcher_fans[0]
@@ -927,14 +993,12 @@ def spawn_ball_event(now: float, ball_type: str):
 
 
 def advance_scoreboard(now: float, is_fever: bool):
-    # 비디오 판독(VAR) 진행 중이면 판독 종료 시 결과 발표
     if st.session_state.var_until > 0:
         if now >= st.session_state.var_until:
             pending = st.session_state.var_pending_type
             st.session_state.var_until = 0.0
             st.session_state.var_pending_type = ""
             if random.random() < 0.65:
-                # 판독 번복 세이프 / 홈런 인정!
                 st.session_state.home_score += 1
                 st.session_state.ticker_msg = f"📺 비디오 판독 결과: 원심 번복 [{pending} 인정!!] 구장이 열광합니다!"
                 if not is_fever:
@@ -1032,7 +1096,6 @@ def advance_scoreboard(now: float, is_fever: bool):
         st.session_state.ticker_msg = f"🎆 초대형 {runs}점 홈런!! 구장이 떠나갈 듯 들썩입니다!!"
         if not is_fever:
             activate_fever(now, f"{runs}점 홈런 폭발!!")
-        # 홈런 직후 낮은 확률로 매점 지붕 쪽 기록 홈런볼 쟁탈전 발동
         if not st.session_state.foul_active and random.random() < 0.45:
             spawn_ball_event(now, "homerunball")
 
@@ -1113,7 +1176,6 @@ def process_game_tick():
     time_left = cfg["duration"] - elapsed_inning
     is_bottom = elapsed_inning >= (cfg["duration"] / 2.0)
 
-    # 5회말 시작 시(클리닝 타임 러시 발동: 12초간 손님 6칸 & 매출 2배)
     if inning == 5 and is_bottom and not st.session_state.cleaning_triggered:
         st.session_state.cleaning_triggered = True
         st.session_state.cleaning_until = now + 12.0
@@ -1122,7 +1184,6 @@ def process_game_tick():
         for _ in range(3):
             spawn_customer(now, True)
 
-    # 9회말 막판 14초 '끝내기 찬스' 발동
     if inning == 9 and is_bottom and not st.session_state.walkoff_triggered:
         st.session_state.walkoff_triggered = True
         st.session_state.bases = [True, True, True]
@@ -1131,7 +1192,6 @@ def process_game_tick():
         st.session_state.balls = 3
         activate_fever(now, "9회말 2아웃 만루 풀카운트 끝내기 찬스!!")
 
-    # 1) 피버 타임 종료 체크
     if st.session_state.fever_until > 0 and now >= st.session_state.fever_until:
         st.session_state.fever_until = 0.0
         st.session_state.fever_gauge = 0
@@ -1139,7 +1199,6 @@ def process_game_tick():
 
     is_fever = now < st.session_state.fever_until
 
-    # 2) 파울볼/홈런볼 제한시간 초과 체크
     if st.session_state.foul_active and now >= st.session_state.foul_deadline:
         b_type = st.session_state.foul_type
         st.session_state.foul_active = False
@@ -1152,7 +1211,8 @@ def process_game_tick():
             trigger_sound("foul_miss")
             st.toast("💥 파울볼이 매점에 떨어졌습니다! 2초간 조리/서빙 정지 & 콤보 초기화!", icon="⚠️")
 
-    # 3) 조리대 상태 갱신
+    # 3) 조리대 상태 갱신 (조리 완료 시 주방 벨 'cook_ready' 사운드 재생!)
+    any_newly_ready = False
     chicken_cook_req = 1.0 if is_fever else float(MENUS["순살치킨"]["cook_time"])
     burn_limit = float(MENUS["순살치킨"]["burn_limit"])
     for slot in st.session_state.chicken_slots:
@@ -1160,6 +1220,7 @@ def process_game_tick():
             if now - slot["start_time"] >= chicken_cook_req:
                 slot["state"] = "ready"
                 slot["ready_time"] = now
+                any_newly_ready = True
         elif slot["state"] == "ready":
             if now - slot["ready_time"] >= burn_limit:
                 slot["state"] = "burned"
@@ -1174,8 +1235,11 @@ def process_game_tick():
             if now - slot["start_time"] >= shrimp_cook_req:
                 slot["state"] = "ready"
                 slot["ready_time"] = now
+                any_newly_ready = True
 
-    # 4) 손님 인내심 체크 (풀카운트 3B-2S 또는 비디오 판독 중에는 관중이 전광판을 보느라 인내심 감소 1초 보정!)
+    if any_newly_ready:
+        trigger_sound("cook_ready")
+
     is_full_count = (st.session_state.balls == 3 and st.session_state.strikes == 2)
     is_var = now < st.session_state.var_until
     if is_full_count or is_var:
@@ -1191,7 +1255,6 @@ def process_game_tick():
             remaining_customers.append(cust)
     st.session_state.customers = remaining_customers
 
-    # 5) 1초 주기 이벤트
     if now - st.session_state.last_sec_tick >= 0.95:
         st.session_state.last_sec_tick = now
         advance_scoreboard(now, is_fever)
@@ -1205,7 +1268,6 @@ def process_game_tick():
             if len(st.session_state.customers) == 0 or random.random() < 0.45:
                 spawn_customer(now, False)
 
-        # 파울볼 돌발 이벤트 (플라이 70% / 총알 라인드라이브 30%)
         if (
             not st.session_state.foul_active
             and now >= st.session_state.stun_until
@@ -1215,7 +1277,6 @@ def process_game_tick():
             b_type = "linedrive" if random.random() < 0.30 else "fly"
             spawn_ball_event(now, b_type)
 
-    # 6) 현재 이닝 제한 시간 종료 판정
     if time_left <= 0:
         if st.session_state.inning_gold >= cfg["target"]:
             if inning < 9:
@@ -1337,6 +1398,11 @@ def handle_start_cook(slot_list_key: str, idx: int):
         slot["state"] = "cooking"
         slot["start_time"] = now
         slot["ready_time"] = 0.0
+        # 조리 기구에 따라 각기 다른 주방 현장 사운드 발동!
+        if slot_list_key == "chicken_slots":
+            trigger_sound("fry_start")
+        else:
+            trigger_sound("pan_start")
 
 
 def handle_serve_cooked(slot_list_key: str, idx: int, menu_name: str):
@@ -1535,7 +1601,6 @@ def render_hud(now: float, is_fever: bool):
 
 
 def render_alerts(now: float, is_fever: bool):
-    # 1회차 동적 가이드
     if st.session_state.inning == 1 and st.session_state.total_gold == 0 and st.session_state.customers:
         first_menu = st.session_state.customers[0]["menu"]
         if MENUS[first_menu]["cook_time"] == 0:
@@ -1544,12 +1609,10 @@ def render_alerts(now: float, is_fever: bool):
             tip_msg = f"💡 가이드: 첫 손님이 [{first_menu}]를 주문했습니다! 오른쪽 조리대에서 먼저 [🔥 조리 시작]을 누르세요!"
         st.markdown(f'<div class="tutorial-tip">{tip_msg}</div>', unsafe_allow_html=True)
 
-    # 서빙 성공 즉각 시각 피드백 배너
     banner_msg, banner_until = st.session_state.gain_banner
     if banner_msg and now < banner_until:
         st.markdown(f'<div class="gain-popup">{banner_msg}</div>', unsafe_allow_html=True)
 
-    # 5회말 클리닝 타임 러시 배너
     if now < st.session_state.cleaning_until:
         clean_left = max(0.0, st.session_state.cleaning_until - now)
         st.markdown(
@@ -1557,7 +1620,6 @@ def render_alerts(now: float, is_fever: bool):
             unsafe_allow_html=True,
         )
 
-    # 비디오 판독(VAR) 또는 풀카운트(3B-2S) 관중 집중 보너스 안내
     if now < st.session_state.var_until:
         var_left = max(0.0, st.session_state.var_until - now)
         st.markdown(
@@ -1581,7 +1643,6 @@ def render_alerts(now: float, is_fever: bool):
             unsafe_allow_html=True,
         )
 
-    # 파울볼 / 라인드라이브 / 홈런볼 미니게임
     if st.session_state.foul_active:
         foul_left = max(0.0, st.session_state.foul_deadline - now)
         b_type = st.session_state.foul_type
@@ -1773,7 +1834,7 @@ def render_kitchen(now: float, is_fever: bool):
                 pct = min(100, int((elapsed / c_cook_req) * 100))
                 st.markdown(
                     f"""<div class="cook-card">
-                        <strong>튀김기 #{idx+1} · 조리 중 ({rem:.1f}초)</strong>
+                        <strong>튀김기 #{idx+1} · 🔊자글자글 튀기는 중 ({rem:.1f}초)</strong>
                         <div style="background:#fde68a; height:7px; border-radius:4px; margin-top:5px;">
                             <div style="width:{pct}%; height:100%; background:#d97706;"></div>
                         </div>
@@ -1848,7 +1909,7 @@ def render_kitchen(now: float, is_fever: bool):
                 pct = min(100, int((elapsed / s_cook_req) * 100))
                 st.markdown(
                     f"""<div class="cook-card">
-                        <strong>전용 팬 #{idx+1} · 조리 중 ({rem:.1f}초)</strong>
+                        <strong>전용 팬 #{idx+1} · 🔊지글지글 볶는 중 ({rem:.1f}초)</strong>
                         <div style="background:#fde68a; height:7px; border-radius:4px; margin-top:5px;">
                             <div style="width:{pct}%; height:100%; background:#d97706;"></div>
                         </div>
@@ -1895,7 +1956,6 @@ def render_start_screen():
 
     c1, c2, c3 = st.columns([0.9, 2.4, 0.9])
     with c2:
-        # 구장 선택 셀렉터
         selected_stadium = st.selectbox(
             "🏟️ 오늘 출근할 홈구장을 선택하세요",
             options=list(STADIUMS.keys()),
@@ -1955,6 +2015,7 @@ def render_gameover_screen():
     render_sound_engine(
         st.session_state.sound_id,
         st.session_state.sound_type,
+        False,
         False,
         st.session_state.sound_muted,
     )
@@ -2033,6 +2094,9 @@ def run_gameplay_fragment():
 
     now = st.session_state.pause_started_at if st.session_state.paused else time.time()
     is_fever = (not st.session_state.paused) and (now < st.session_state.fever_until)
+    is_cooking = (not st.session_state.paused) and any(
+        s["state"] == "cooking" for s in (st.session_state.chicken_slots + st.session_state.shrimp_slots)
+    )
 
     st.markdown(FEVER_BG_CSS if is_fever else NORMAL_BG_CSS, unsafe_allow_html=True)
 
@@ -2040,6 +2104,7 @@ def run_gameplay_fragment():
         st.session_state.sound_id,
         st.session_state.sound_type,
         is_fever,
+        is_cooking,
         st.session_state.sound_muted,
     )
 
